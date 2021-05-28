@@ -1,0 +1,228 @@
+
+pipeline {
+  agent {
+    kubernetes {
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    some-label: test-odu
+spec:
+  securityContext:
+    runAsUser: 10000
+    runAsGroup: 10000
+  containers:
+  - name: jnlp
+    image: 'jenkins/jnlp-slave:4.3-4-alpine'
+    args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
+  - name: maven
+    image: maven:latest
+    command:
+    - cat
+    tty: true
+    imagePullPolicy: Always
+    securityContext: # https://github.com/GoogleContainerTools/kaniko/issues/681
+      runAsUser: 0
+      runAsGroup: 0
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug-1534f90c9330d40486136b2997e7972a79a69baf
+    imagePullPolicy: Always
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+      - name: regsecret
+        mountPath: /kaniko/.docker
+    securityContext: # https://github.com/GoogleContainerTools/kaniko/issues/681
+      runAsUser: 0
+      runAsGroup: 0
+  - name: openshift-cli
+    image: openshift/origin-cli:v3.11.0
+    command:
+    - cat
+    tty: true
+    securityContext: # https://github.com/GoogleContainerTools/kaniko/issues/681
+      runAsUser: 0
+      runAsGroup: 0
+  - name: ibm-cloud-developer-tools
+    image: ibmcom/ibm-cloud-developer-tools-amd64
+    command:
+    - cat
+    tty: true
+    securityContext: # https://github.com/GoogleContainerTools/kaniko/issues/681
+      runAsUser: 0
+      runAsGroup: 0
+  volumes:
+  - name: regsecret
+    projected:
+      sources:
+      - secret:
+          name: regsecret
+          items:
+            - key: .dockerconfigjson
+              path: config.json
+  imagePullSecrets:
+  - name: regsecret
+"""
+    }
+  }
+
+
+  environment {
+    
+    
+    /* -----------DevOps Commander  created env variables------------ */
+
+DOCKER_URL= "us.icr.io/dc-tools"
+DOCKER_CREDENTIAL_ID= "dc-docker-1814"
+OCP_URL= "https://c103-e.us-south.containers.cloud.ibm.com:31018"
+OCP_CREDENTIAL_ID= "dc-ocp-1814"
+SONARQUBE_URL= "https://sonarqube-1749-3725.dc-ig-lib-ga-1589529604-f72ef11f3ab089a8c677044eb28292cd-0000.au-syd.containers.appdomain.cloud"
+SONARQUBE_CREDENTIAL_ID= "dc-sonarqube-1814"
+NAMESPACE= "dc-apps"
+INGRESS= "verizon-poc-1615357584710-f72ef11f3ab089a8c677044eb28292cd-0000.sjc03.containers.appdomain.cloud"
+    /* -----------DevOps Commander  created env variables------------ */
+
+    DOCKER_IMAGE = readMavenPom().getArtifactId()
+    // DOCKER_TAG = "$BUILD_NUMBER"
+    DOCKER_TAG = readMavenPom().getVersion()
+    //DEPLOYMENT_NAME = readMavenPom().getArtifactId()
+    DEPLOYMENT_NAME="${JOB_BASE_NAME}".toLowerCase()
+    componentVersion = readMavenPom().getVersion()
+  }
+  stages {
+
+
+
+    stage('Build & Unit Test') {
+      steps {
+        container('maven'){
+              sh 'echo $PATH && mvn -version && echo $JAVA_HOME && mvn -V clean install '
+        }
+      }
+    }
+
+
+
+    stage('SonarQube Code Analysis') {
+	   when {
+               beforeOptions true
+               expression { env.SONARQUBE_URL }
+           }
+           steps {
+                   container('maven'){
+                   sh '''
+		      mkdir .sonar .sonar/cache .scannerwork
+                      chmod -R 777 .sonar
+                      chmod -R 777 .scannerwork
+		      export SONAR_USER_HOME=${WORKSPACE}
+		      mvn org.sonarsource.scanner.maven:sonar-maven-plugin:3.3.0.603:sonar \
+		      -f pom.xml \
+		      -Dsonar.host.url=$SONARQUBE_URL  \
+		      -Dsonar.projectKey=${NAMESPACE}-${DEPLOYMENT_NAME} \
+		      -Dsonar.projectName=${NAMESPACE}-${DEPLOYMENT_NAME} \
+		      -Dsonar.language=java \
+		      -Dsonar.sources=. \
+		      -Dsonar.java.binaries=target/classes \
+		      -Dsonar.tests=. \
+		      -Dsonar.test.inclusions=**/*Test*/* \
+		      -Dsonar.exclusions=target/**/*.class
+		   '''
+		   }
+                 
+             }
+        }
+
+
+
+
+    stage ('Build: Docker') {
+       steps {
+           container('maven') {
+                withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDENTIAL_ID}", usernameVariable: 'REGISTRY_USERNAME', passwordVariable: 'REGISTRY_PASSWORD')]) {
+               /* Kaniko uses secret 'regsecret' declared in the POD to authenticate to the registry and push the image */
+               sh '''
+               mvn quarkus:add-extension -Dextensions="container-image-jib"
+               echo $DOCKER_URL
+               REGISTRY_HOST_URL=`echo $DOCKER_URL |cut -f1 -d"/"`
+               REGISTRY_GROUP=`echo $DOCKER_URL |cut -f2 -d"/"`
+              mvn clean package \
+ -Dquarkus.container-image.push=true \
+ -Dquarkus.container-image.builder=jib \
+ -Dquarkus.container-image.registry=${REGISTRY_HOST_URL} \
+ -Dquarkus.container-image.group=${REGISTRY_GROUP} \
+ -Dquarkus.container-image.username=${REGISTRY_USERNAME} \
+ -Dquarkus.container-image.password=${REGISTRY_PASSWORD} \
+ -Dquarkus.container-image.name=${DOCKER_IMAGE} \
+ -Dquarkus.container-image.tag=${DOCKER_TAG} \
+ -Dquarkus.container-image.build=true              '''
+                }
+            }
+         }
+       }
+   stage ('Secure: Image scan - Clair') {
+       steps {
+           container('openshift-cli') {
+               withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDENTIAL_ID}", usernameVariable: 'REGISTRY_USERNAME', passwordVariable: 'REGISTRY_PASSWORD')]) {
+                   script {
+                       catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS') { /* Avoid the stage being FAILURE if Clair founds vulnerabilities above acceptable threshold. That will be calculated later in the gate */
+                         //  sh 'yair.py --clair ${CLAIR_URL} --registry ${REGISTRY_NAME} --username ${REGISTRY_USERNAME} --password ${REGISTRY_PASSWORD} --no-namespace ${DOCKER_IMAGE}:${DOCKER_TAG}'
+    sh 'wget https://github.com/optiopay/klar/releases/download/v2.4.0/klar-2.4.0-linux-amd64'
+    sh 'mv klar-2.4.0-linux-amd64 klar'
+    sh 'chmod 755 klar'
+                sh 'export CLAIR_ADDR=${CLAIR_URL} && export DOCKER_PASSWORD=${REGISTRY_PASSWORD} && export DOCKER_USER=${REGISTRY_USERNAME} && ./klar ${DOCKER_URL}/${DOCKER_IMAGE}:${DOCKER_TAG}  '
+                       }
+                   }
+               }
+           }
+       }
+       post {
+           always {
+               sh 'rm -rf $WORKSPACE/reports/clair && mkdir -p $WORKSPACE/reports/clair'
+      //         sh 'cp clair-results.json $WORKSPACE/reports/clair'
+           }
+       }
+   }
+
+    stage('Deploy: To Openshift') {
+        steps {
+          container('openshift-cli') {
+	     withCredentials([
+	        usernamePassword(credentialsId: "${OCP_CREDENTIAL_ID}", usernameVariable: 'REGISTRY_USERNAME', passwordVariable: 'TOKEN'),
+		      usernamePassword(credentialsId: "${DOCKER_CREDENTIAL_ID}", usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')
+	     ]) {
+              sh '''
+              oc login --server="${OCP_URL}" --token="${TOKEN}"
+              oc project ${NAMESPACE}
+              pwd
+              ls -ltr
+              oc create secret docker-registry docker-repo-cred \
+              --docker-server=${DOCKER_URL} \
+              --docker-username=${DOCKER_USERNAME} \
+              --docker-password=${DOCKER_PASSWORD} \
+              --docker-email=${DOCKER_PASSWORD} \
+              --namespace=${NAMESPACE} || true
+              sed -e "s~{REGISTRY_NAME}~$DOCKER_URL~g" \
+                  -e "s~{DOCKER_IMAGE}~$DOCKER_IMAGE~g" \
+                  -e "s~{DOCKER_TAG}~$DOCKER_TAG~g" \
+                  -e "s~{K8S_DEPLOYMENT}~$DEPLOYMENT_NAME~g" \
+                  -e "s~{INGRESS_URL}~$INGRESS~g" -i devops/k8s/*.yml
+              oc apply -f devops/k8s/ --namespace="${NAMESPACE}" || true
+              oc delete pod --selector app=$DEPLOYMENT_NAME  || true
+              oc create route edge --service=${DEPLOYMENT_NAME}-svc --hostname=$DEPLOYMENT_NAME.$INGRESS ||true
+              oc wait --for=condition=available --timeout=120s deployment/${DEPLOYMENT_NAME} --namespace="${NAMESPACE}" || true
+              '''
+	     }
+           }
+         }
+        }
+
+
+
+
+    }
+}
+
+
+
